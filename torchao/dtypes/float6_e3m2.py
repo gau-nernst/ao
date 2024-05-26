@@ -176,3 +176,90 @@ def from_float6_e3m2(tensor: Tensor, no_bit_packing: bool = False, dtype: torch.
     val2 = _pt_float6_e3m2_to_float32(((bits1 & 0xF) << 2) | (bits2 >> 6)).to(dtype)
     val3 = _pt_float6_e3m2_to_float32(bits2 & 0x3F).to(dtype)
     return torch.stack([val0, val1, val2, val3], dim=-1).flatten(-2)
+
+
+if has_triton():
+    @triton.jit
+    def scaled_matmul_kernel_with_block_pointers(
+        # Pointers to matrices
+        a_ptr,
+        b_ptr,
+        b_2bit_ptr,
+        b_4bit_ptr,
+        c_ptr,
+        s1_ptr,
+        # Matrix dimensions
+        M,
+        N,
+        K,
+        # The stride variables represent how much to increase the ptr by when moving by 1
+        # element in a particular dimension. E.g. `stride_am` is how much to increase `a_ptr`
+        # by to get the element one row down (A has M rows).
+        stride_am,
+        stride_ak,
+        stride_bk,
+        stride_bn,
+        # stride_cm,
+        # stride_cn,
+        # stride_s1m,
+        # stride_s1n,
+        # Meta-parameters
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        GROUP_M: tl.constexpr,
+        EVEN_K: tl.constexpr,
+        ACC_TYPE: tl.constexpr = tl.float32,
+    ):
+        # based on triton.ops.matmul
+        pid = tl.program_id(0)
+        grid_m = (M + BLOCK_M - 1) // BLOCK_M
+        grid_n = (N + BLOCK_N - 1) // BLOCK_N
+
+        # re-order program ID for better L2 performance
+        width = GROUP_M * grid_n
+        group_id = pid // width
+        group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
+        pid_m = group_id * GROUP_M + (pid % group_size)
+        pid_n = (pid % width) // (group_size)
+
+        rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
+        rk = tl.arange(0, BLOCK_K)
+        A = a_ptr + (ram[:, None] * stride_am + rk[None, :] * stride_ak)
+
+        # TODO: load b_2bit and b_4bit, reconstruct b
+        # 2bit: load as uint8, 4 values in 1 uint8 -> divide N by 4
+        # 4bit: load as uint8, 2 values in 1 uint8 -> divide N by 2
+        # what if b is transposed?
+        rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
+        B = b_ptr + (rk[:, None] * stride_bk + rbn[None, :] * stride_bn)
+
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+        for k in range(K, 0, -BLOCK_K):
+            if EVEN_K:
+                a = tl.load(A)
+                b = tl.load(B)
+            else:
+                a = tl.load(A, mask=rk[None, :] < k, other=0.0)
+                b = tl.load(B, mask=rk[:, None] < k, other=0.0)
+            acc += tl.dot(a, b)
+            A += BLOCK_K * stride_ak
+            B += BLOCK_K * stride_bk
+
+        # rematerialize rm and rn to save registers
+        rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        idx_m = rm[:, None]
+        idx_n = rn[None, :]
+        mask = (idx_m < M) & (idx_n < N)
+
+        # inductor generates a suffix
+        xindex = idx_n + (N * idx_m)
+        tmp0 = tl.load(
+            s1_ptr + (tl.broadcast_to(idx_m, mask.shape)),
+            mask,
+            eviction_policy="evict_last",
+        )
+        tl.store(c_ptr + (tl.broadcast_to(xindex, mask.shape)), acc * tmp0, mask)
