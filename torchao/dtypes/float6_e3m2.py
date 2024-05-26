@@ -180,7 +180,7 @@ def from_float6_e3m2(tensor: Tensor, no_bit_packing: bool = False, dtype: torch.
 
 if has_triton():
     @triton.jit
-    def scaled_matmul_kernel_with_block_pointers(
+    def float16_float6_e3m2_matmul(
         # Pointers to matrices
         a_ptr,
         b_ptr,
@@ -208,7 +208,6 @@ if has_triton():
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
         GROUP_M: tl.constexpr,
-        EVEN_K: tl.constexpr,
         ACC_TYPE: tl.constexpr = tl.float32,
     ):
         # based on triton.ops.matmul
@@ -236,17 +235,34 @@ if has_triton():
         rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
         B = b_ptr + (rk[:, None] * stride_bk + rbn[None, :] * stride_bn)
 
+        B_2bit = b_2bit_ptr + rk[:, None] * (N // 4) + (pid_n * (BLOCK_N // 4)) + tl.arange(0, BLOCK_N // 4)
+        B_4bit = b_4bit_ptr + rk[:, None] * (N // 2) + (pid_n * (BLOCK_N // 2)) + tl.arange(0, BLOCK_N // 2)
+
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
         for k in range(K, 0, -BLOCK_K):
-            if EVEN_K:
-                a = tl.load(A)
-                b = tl.load(B)
-            else:
-                a = tl.load(A, mask=rk[None, :] < k, other=0.0)
-                b = tl.load(B, mask=rk[:, None] < k, other=0.0)
+            a = tl.load(A)
+            # b = tl.load(B)
+
+            b_2bit = tl.load(B_2bit)
+            b_4bit = tl.load(B_4bit)
+
+            # unpack 4 2-bit into 4 16-bit
+            b_2bit = b_2bit.to(tl.uint64, bitcast=True)
+            b_2bit = ((b_2bit & 0xc0) << 56) | ((b_2bit & 0x30) << 42) | ((b_2bit & 0x0c) << 28) | ((b_2bit & 0x03) << 14)
+            b_2bit = b_2bit.to(tl.uint16, bitcast=True)
+
+            # unpack 2 4-bit into 2 16-bit
+            # TODO: adjust bit shift
+            b_4bit = b_4bit.to(tl.uint32, bitcast=True)
+            b_4bit = ((b_4bit & 0xf0) << 8) | ((b_4bit & 0x0f) << 4)
+            b_4bit = b_4bit.to(tl.uint16, bitcast=True)
+
             acc += tl.dot(a, b)
             A += BLOCK_K * stride_ak
-            B += BLOCK_K * stride_bk
+            # B += BLOCK_K * stride_bk
+
+            B_2bit += BLOCK_K * (N // 4)
+            B_4bit += BLOCK_K * (N // 2)
 
         # rematerialize rm and rn to save registers
         rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
