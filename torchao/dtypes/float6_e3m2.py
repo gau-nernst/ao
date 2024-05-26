@@ -232,7 +232,7 @@ if has_triton():
         # TODO: load b_2bit and b_4bit, reconstruct b
         # 2bit: load as uint8, 4 values in 1 uint8 -> divide N by 4
         # 4bit: load as uint8, 2 values in 1 uint8 -> divide N by 2
-        # what if b is transposed?
+        # what if b is transposed? divide K instead
         rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
         B = b_ptr + (rk[:, None] * stride_bk + rbn[None, :] * stride_bn)
 
