@@ -294,7 +294,7 @@ def float16_float6_e3m2_matmul_kernel(
         b_4bit_1 = (b_4bit & 0x0f) << 8
         b_4bit = tl.join(b_4bit_0, b_4bit_1).reshape(BLOCK_K, BLOCK_N)
 
-        #        sign bit     |   first mantissa bit     | 2 mantissa bits and 2 exponent bits
+        #        sign bit     |    first mantissa bit    | 2 mantissa bits and 2 exponent bits
         b = (b_2bit & 0x8000) | ((b_2bit & 0x4000) >> 2) | b_4bit
         b = b.to(tl.uint16).to(tl.float16, bitcast=True)
         b *= 2 ** (15 - 3) * scales  # exponent bias correction
