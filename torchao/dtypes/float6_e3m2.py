@@ -259,12 +259,9 @@ def float16_float6_e3m2_matmul_kernel(
     rk = tl.arange(0, BLOCK_K)
     A = a_ptr + (ram[:, None] * stride_am + rk[None, :] * stride_ak)
 
-    tl.static_assert(not IS_BFLOAT16, "bfloat16 is not implemented yet.")
-
     # 2bit: load as uint8, 4 values in 1 uint8 -> divide N by 4
     # 4bit: load as uint8, 2 values in 1 uint8 -> divide N by 2
     # what if b is transposed? divide K instead
-
     B_2bit = b_2bit_ptr + rk[:, None] * (N // 4) + (pid_n * (BLOCK_N // 4)) + tl.arange(0, BLOCK_N // 4)
     B_4bit = b_4bit_ptr + rk[:, None] * (N // 2) + (pid_n * (BLOCK_N // 2)) + tl.arange(0, BLOCK_N // 2)
 
@@ -272,6 +269,11 @@ def float16_float6_e3m2_matmul_kernel(
         scales_ptr + (tl.broadcast_to(rn[None, :], BLOCK_K, BLOCK_N)),
         eviction_policy="evict_last",
     )
+
+    if IS_BFLOAT16:
+        scales *= tl.full((1,), 2.0 ** (127 - 3), dtype=tl.bfloat16)
+    else:
+        scales *= tl.full((1,), 2.0 ** (15 - 3), dtype=tl.float16)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
     for k in range(K, 0, -BLOCK_K):
@@ -290,16 +292,21 @@ def float16_float6_e3m2_matmul_kernel(
 
         # unpack 2 4-bit into 2 16-bit
         b_4bit = b_4bit.to(tl.int32)
-        b_4bit_0 = (b_4bit & 0xf0) << 4
-        b_4bit_1 = (b_4bit & 0x0f) << 8
+        b_4bit_0 = (b_4bit & 0xf0) << 8
+        b_4bit_1 = (b_4bit & 0x0f) << 12
         b_4bit = tl.join(b_4bit_0, b_4bit_1).reshape(BLOCK_K, BLOCK_N)
 
-        #        sign bit     |    first mantissa bit    | 2 mantissa bits and 2 exponent bits
-        b = (b_2bit & 0x8000) | ((b_2bit & 0x4000) >> 2) | b_4bit
-        b = b.to(tl.uint16).to(tl.float16, bitcast=True)
-        b *= 2 ** (15 - 3) * scales  # exponent bias correction
+        if IS_BFLOAT16:
+            #        sign bit     |    first exponent bit    | 2 exponent bits and 2 mantissa bits
+            b = (b_2bit & 0x8000) | ((b_2bit & 0x4000) >> 5) | (b_4bit >> 7)
+            b = b.to(tl.uint16).to(tl.bfloat16, bitcast=True)
 
-        acc += tl.dot(a, b)
+        else:
+            #        sign bit     |    first exponent bit    | 2 exponent bits and 2 mantissa bits
+            b = (b_2bit & 0x8000) | ((b_2bit & 0x4000) >> 2) | (b_4bit >> 4)
+            b = b.to(tl.uint16).to(tl.float16, bitcast=True)
+
+        acc += tl.dot(a, b * scales)
         A += BLOCK_K * stride_ak
 
         B_2bit += BLOCK_K * (N // 4)
@@ -321,24 +328,27 @@ def float16_float6_e3m2_matmul(A: torch.Tensor, B_2bit: torch.Tensor, B_4bit: to
     M, K = A.shape
     N = B_2bit.shape[1] * 4
 
-    assert A.dtype is torch.float16
+    assert A.dtype in (torch.float16, torch.bfloat16)
+    assert scales.dtype == A.dtype
     assert K % 64 == 0
     assert N % 64 == 0
 
     C = torch.empty(M, N, device=A.device, dtype=A.dtype)
     grid = lambda META: (triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']),)
-    float16_float6_e3m2_matmul_kernel[grid](A, B_2bit, B_4bit, C, scales, M, N, K, A.stride(0), A.stride(1))
+    float16_float6_e3m2_matmul_kernel[grid](A, B_2bit, B_4bit, C, scales, M, N, K, A.stride(0), A.stride(1), IS_BFLOAT16=A.dtype is torch.bfloat16)
     return C
 
 
 if __name__ == "__main__":
     M, N, K = 4, 1024, 1024
-    A = torch.randn(M, K, device="cuda", dtype=torch.float16)
-    B = torch.randn(K, N, device="cuda", dtype=torch.float16)
+    dtype = torch.bfloat16
+    A = torch.randn(M, K, device="cuda", dtype=dtype)
+    B = torch.randn(K, N, device="cuda", dtype=dtype)
 
-    scales = B.abs().amax(0) / FLOAT6_E3M2_MAX
+    scales = B.float().abs().amax(0) / FLOAT6_E3M2_MAX
     scales[scales == 0.0] = 1.0
     B_scaled = B / scales
+    scales = scales.to(dtype)
     B_6bit = to_float6_e3m2(B_scaled, no_bit_packing=True)
 
     B_2bit = (B_6bit >> 4) & 0b11
