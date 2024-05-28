@@ -145,7 +145,16 @@ def float16_float6_e3m2_matmul(A: torch.Tensor, B_2bit: torch.Tensor, B_4bit: to
 
     C = torch.empty(M, N, device=A.device, dtype=A.dtype)
     grid = lambda META: (triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']),)
-    float16_float6_e3m2_matmul_kernel[grid](A, B_2bit, B_4bit, C, scales, M, N, K, A.stride(0), A.stride(1), IS_BFLOAT16=A.dtype is torch.bfloat16)
+    float16_float6_e3m2_matmul_kernel[grid](
+        A,
+        B_2bit,
+        B_4bit,
+        C,
+        scales,
+        M, N, K,
+        A.stride(0), A.stride(1),
+        USE_BFLOAT16=A.dtype is torch.bfloat16,
+    )
     return C
 
 
