@@ -238,27 +238,3 @@ def float16_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
         A.stride(0), A.stride(1),
     )
     return C
-
-
-if __name__ == "__main__":
-    M, N, K = 4, 1024, 1024
-    dtype = torch.bfloat16
-    A = torch.randn(M, K, device="cuda", dtype=dtype)
-    B = torch.randn(K, N, device="cuda", dtype=dtype)
-
-    scales = B.float().abs().amax(0) / FLOAT6_E3M2_MAX
-    scales[scales == 0.0] = 1.0
-    B_scaled = B / scales
-    scales = scales.to(dtype)
-    B_6bit = to_float6_e3m2(B_scaled, no_bit_packing=True)
-
-    B_2bit = (B_6bit >> 4) & 0b11
-    B_4bit = B_6bit & 0b1111
-
-    B_2bit = (B_2bit[..., ::4] << 6) | (B_2bit[..., 1::4] << 4) | (B_2bit[..., 2::4] << 2) | B_2bit[..., 3::4]
-    B_4bit = (B_4bit[..., ::2] << 4) | B_4bit[..., 1::2]
-
-    C = float16_float6_e3m2_matmul(A, B_2bit, B_4bit, scales)
-
-    print(A @ B)
-    print(C)

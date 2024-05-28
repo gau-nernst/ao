@@ -6,6 +6,8 @@ import pandas as pd
 
 
 def benchmark(f, *args):
+    print(f(*args))
+
     measurement = Timer(
         stmt="f(*args)",
         globals=dict(f=f, args=args),
