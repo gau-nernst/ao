@@ -1,6 +1,6 @@
 import torch
 from torchao.quantization.fp6_llm import Fp6LlmLinear
-from torchao.prototype.fp6.fp16_fp6_triton import float16_float6_e3m2_matmul, FLOAT6_E3M2_MAX, to_float6_e3m2
+from torchao.prototype.fp6.fp16_fp6_triton import float16_float6_e3m2_matmul, FLOAT6_E3M2_MAX, to_float6_e3m2, float16_matmul
 from torch.utils.benchmark import Timer
 import pandas as pd
 
@@ -41,6 +41,7 @@ if __name__ == "__main__":
 
     results = []
     results.append(["Baseline (CuDNN)", benchmark(torch.matmul, A, B)])
+    results.append(["FP16-triton", benchmark(float16_matmul, A, B)])
     results.append(["FP6-LLM", benchmark(linear_fp6_llm, A)])
     results.append(["FP6-triton", benchmark(float16_float6_e3m2_matmul, A, B_2bit, B_4bit, scales)])
 
