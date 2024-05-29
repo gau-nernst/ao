@@ -128,12 +128,13 @@ def float16_float6_e3m2_matmul_kernel(
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
-    scales_ptrs = scales_ptr + tl.broadcast_to(offs_n[None, :], BLOCK_M, BLOCK_N)
+    scales_ptrs = scales_ptr + offs_n[None, :]
     scales = tl.load(scales_ptrs)
     acc = acc * scales
 
     c_ptrs = c_ptr + (offs_m[:, None] * N + offs_n[None, :])
-    tl.atomic_add(c_ptrs, acc)
+    mask = (offs_m < M)[:, None] & (offs_n < N)[None, :]
+    tl.atomic_add(c_ptrs, acc, mask=mask)
 
 
 def float16_float6_e3m2_matmul(A: torch.Tensor, B_2bit: torch.Tensor, B_4bit: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
