@@ -25,15 +25,15 @@ def get_cuda_autotune_config():
     ]
 
 @triton.jit
-def grouped_launch( pid, m, n, block_m: tl.constexpr, block_n: tl.constexpr, group_m: tl.constexpr):
-    grid_m = tl.cdiv(m, block_m)
-    grid_n = tl.cdiv(n, block_n)
+def grouped_launch(pid, M, N, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, GROUP_M: tl.constexpr):
+    grid_m = tl.cdiv(M, BLOCK_M)
+    grid_n = tl.cdiv(N, BLOCK_N)
 
-    width = group_m * grid_n
+    width = GROUP_M * grid_n
     group_id = pid // width
-    group_size = tl.minimum(grid_m - group_id * group_m, group_m)
+    group_size = tl.minimum(grid_m - group_id * GROUP_M, GROUP_M)
 
-    pid_m = group_id * group_m + (pid % group_size)
+    pid_m = group_id * GROUP_M + (pid % group_size)
     pid_n = (pid % width) // group_size
 
     return pid_m, pid_n
@@ -49,7 +49,7 @@ def float16_float6_e3m2_matmul_kernel(
     b_2bit_ptr,
     b_4bit_ptr,
     c_ptr,
-    scales_ptr,
+    b_scale_ptr,
     # Matrix dimensions
     M,
     N,
@@ -83,8 +83,8 @@ def float16_float6_e3m2_matmul_kernel(
     # 2bit: load as uint8, 4 values in 1 uint8 -> divide N by 4
     # 4bit: load as uint8, 2 values in 1 uint8 -> divide N by 2
     # what if b is transposed? divide K instead
-    b_2bit_ptrs = b_2bit_ptr + (offs_k[:, None] * (N // 4) + (pid_n * (BLOCK_N // 4) + tl.arange(0, BLOCK_N // 4)))
-    b_4bit_ptrs = b_4bit_ptr + (offs_k[:, None] * (N // 2) + (pid_n * (BLOCK_N // 2) + tl.arange(0, BLOCK_N // 2)))
+    b_2bit_ptrs = b_2bit_ptr + (offs_k[:, None] * (N // 4) + (pid_n * (BLOCK_N // 4) + tl.arange(0, BLOCK_N // 4))[None, :])
+    b_4bit_ptrs = b_4bit_ptr + (offs_k[:, None] * (N // 2) + (pid_n * (BLOCK_N // 2) + tl.arange(0, BLOCK_N // 2))[None, :])
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
     for _ in range(0, grid_k):
@@ -118,7 +118,7 @@ def float16_float6_e3m2_matmul_kernel(
             b = b.to(tl.uint16).to(tl.float16, bitcast=True)
             b *= tl.full((1,), 2.0 ** (15 - 3), dtype=tl.float16)
 
-        acc += tl.dot(a, b, out_dtype=ACC_TYPE)
+        acc = tl.dot(a, b, acc, out_dtype=ACC_TYPE)
 
         a_ptrs += BLOCK_K * SPLIT_K * stride_ak
         b_2bit_ptrs += BLOCK_K * SPLIT_K * (N // 4)
@@ -128,21 +128,20 @@ def float16_float6_e3m2_matmul_kernel(
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
-    scales_ptrs = scales_ptr + offs_n[None, :]
-    scales = tl.load(scales_ptrs)
-    acc = acc * scales
+    b_scale = tl.load(b_scale_ptr + offs_n)
+    acc *= b_scale
 
     c_ptrs = c_ptr + (offs_m[:, None] * N + offs_n[None, :])
     mask = (offs_m < M)[:, None] & (offs_n < N)[None, :]
-    tl.atomic_add(c_ptrs, acc, mask=mask)
+    tl.atomic_add(c_ptrs, acc, mask)
 
 
-def float16_float6_e3m2_matmul(A: torch.Tensor, B_2bit: torch.Tensor, B_4bit: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+def float16_float6_e3m2_matmul(A: torch.Tensor, B_2bit: torch.Tensor, B_4bit: torch.Tensor, B_scale: torch.Tensor) -> torch.Tensor:
     M, K = A.shape
     N = B_2bit.shape[1] * 4
 
     assert A.dtype in (torch.float16, torch.bfloat16)
-    assert scales.dtype == A.dtype
+    assert B_scale.dtype == A.dtype
     assert K % 64 == 0
     assert N % 64 == 0
 
@@ -154,9 +153,10 @@ def float16_float6_e3m2_matmul(A: torch.Tensor, B_2bit: torch.Tensor, B_4bit: to
         B_2bit,
         B_4bit,
         C,
-        scales,
+        B_scale,
         M, N, K,
-        A.stride(0), A.stride(1),
+        A.stride(0),
+        A.stride(1),
         BLOCK_M=32,
         BLOCK_N=32,
         BLOCK_K=64,
@@ -208,10 +208,6 @@ def float16_matmul_kernel(
     ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
     rk = tl.arange(0, BLOCK_K)
     A = a_ptr + (ram[:, None] * stride_am + rk[None, :] * stride_ak)
-
-    # 2bit: load as uint8, 4 values in 1 uint8 -> divide N by 4
-    # 4bit: load as uint8, 2 values in 1 uint8 -> divide N by 2
-    # what if b is transposed? divide K instead
     B = b_ptr + (rk[:, None] * N + rn[None, :])
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
@@ -242,9 +238,7 @@ def float16_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     C = torch.empty(M, N, device=A.device, dtype=A.dtype)
     grid = lambda META: (triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']),)
     float16_matmul_kernel[grid](
-        A,
-        B,
-        C,
+        A, B, C,
         M, N, K,
         A.stride(0), A.stride(1),
     )

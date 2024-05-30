@@ -29,10 +29,10 @@ if __name__ == "__main__":
     B = linear.weight.detach().T.contiguous()
 
     # for triton kernel
-    scales = B.float().abs().amax(0) / FLOAT6_E3M2_MAX
-    scales[scales == 0.0] = 1.0
-    B_scaled = B / scales
-    scales = scales.to(torch.half)
+    B_scale = B.float().abs().amax(0) / FLOAT6_E3M2_MAX
+    B_scale[B_scale == 0.0] = 1.0
+    B_scaled = B / B_scale
+    B_scale = B_scale.to(torch.half)
     B_6bit = to_float6_e3m2(B_scaled, no_bit_packing=True)
 
     B_2bit = (B_6bit >> 4) & 0b11
@@ -46,7 +46,7 @@ if __name__ == "__main__":
     results.append(["Baseline (CuBLAS)", benchmark(torch.matmul, A, B)])
     results.append(["FP16-triton", benchmark(float16_matmul, A, B)])
     results.append(["FP6-LLM", benchmark(linear_fp6_llm, A)])
-    results.append(["FP6-triton-splitK", benchmark(float16_float6_e3m2_matmul, A, B_2bit, B_4bit, scales)])
+    results.append(["FP6-triton-splitK", benchmark(float16_float6_e3m2_matmul, A, B_2bit, B_4bit, B_scale)])
 
     df = pd.DataFrame(results, columns=["name", "time (ms)"])
     print(df.to_markdown(index=False))
