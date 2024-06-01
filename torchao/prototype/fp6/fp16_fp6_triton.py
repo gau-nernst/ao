@@ -21,7 +21,7 @@ def get_cuda_autotune_config():
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=4, num_warps=4),
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4)
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
     ]
 
 @triton.jit
@@ -40,7 +40,7 @@ def grouped_launch(pid, M, N, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, GROU
 
 
 # @triton.autotune(
-#     configs=get_cuda_autotune_config(),
+#     configs=get_cuda_autotune_config2(),
 #     key=['M', 'N', 'K'],
 # )
 @triton.jit
@@ -83,8 +83,10 @@ def float16_float6_e3m2_matmul_kernel(
     # 2bit: load as uint8, 4 values in 1 uint8 -> divide N by 4
     # 4bit: load as uint8, 2 values in 1 uint8 -> divide N by 2
     # what if b is transposed? divide K instead
-    b_2bit_ptrs = b_2bit_ptr + (offs_k[:, None] * (N // 4) + (pid_n * (BLOCK_N // 4) + tl.arange(0, BLOCK_N // 4))[None, :])
+    b_2bit_offs = offs_k[:, None] * (N // 4) + (pid_n * (BLOCK_N // 4) + tl.arange(0, BLOCK_N // 4))[None, :]
+    b_2bit_ptrs = b_2bit_ptr + b_2bit_offs
     b_4bit_ptrs = b_4bit_ptr + (offs_k[:, None] * (N // 2) + (pid_n * (BLOCK_N // 2) + tl.arange(0, BLOCK_N // 2))[None, :])
+    # b_4bit_ptrs = b_4bit_ptr + b_2bit_offs
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
     for _ in range(0, grid_k):
@@ -92,35 +94,58 @@ def float16_float6_e3m2_matmul_kernel(
         b_2bit = tl.load(b_2bit_ptrs)
         b_4bit = tl.load(b_4bit_ptrs)
 
-        # unpack 4 2-bit into 4 16-bit
-        b_2bit = b_2bit.to(tl.int32)
-        b_2bit_0 = (b_2bit & 0xc0) << 8
-        b_2bit_1 = (b_2bit & 0x30) << 10
-        b_2bit_2 = (b_2bit & 0x0c) << 12
-        b_2bit_3 = (b_2bit & 0x03) << 14
-        b_2bit = tl.join(tl.join(b_2bit_0, b_2bit_2), tl.join(b_2bit_1, b_2bit_3)).reshape(BLOCK_K, BLOCK_N)
+        # b_2bit = b_2bit.to(tl.int32)
+        # b_2bit_0 = (b_2bit & 0xc0) << 8
+        # b_2bit_1 = (b_2bit & 0x30) << 10
+        # b_2bit_2 = (b_2bit & 0x0c) << 12
+        # b_2bit_3 = (b_2bit & 0x03) << 14
+        # b_2bit = tl.interleave(tl.interleave(b_2bit_0, b_2bit_2), tl.interleave(b_2bit_1, b_2bit_3))
 
-        # unpack 2 4-bit into 2 16-bit
-        b_4bit = b_4bit.to(tl.int32)
-        b_4bit_0 = (b_4bit & 0xf0) << 8
-        b_4bit_1 = (b_4bit & 0x0f) << 12
-        b_4bit = tl.join(b_4bit_0, b_4bit_1).reshape(BLOCK_K, BLOCK_N)
+        # # unpack 2 4-bit into 2 16-bit
+        # b_4bit = b_4bit.to(tl.int32)
+        # b_4bit_0 = (b_4bit & 0xf0) << 8
+        # b_4bit_1 = (b_4bit & 0x0f) << 12
+        # b_4bit = tl.interleave(b_4bit_0, b_4bit_1)
 
-        if USE_BFLOAT16:
-            #        sign bit     |    first exponent bit    | 2 exponent bits and 2 mantissa bits
-            b = (b_2bit & 0x8000) | ((b_2bit & 0x4000) >> 5) | (b_4bit >> 7)
-            b = b.to(tl.uint16).to(tl.bfloat16, bitcast=True)
+        # if USE_BFLOAT16:
+        #     #        sign bit     |    first exponent bit    | 2 exponent bits and 2 mantissa bits
+        #     b = (b_2bit & 0x8000) | ((b_2bit & 0x4000) >> 5) | (b_4bit >> 7)
+        #     b = b.to(tl.uint16).to(tl.bfloat16, bitcast=True)
 
-        else:
-            #        sign bit     |    first exponent bit    | 2 exponent bits and 2 mantissa bits
-            b = (b_2bit & 0x8000) | ((b_2bit & 0x4000) >> 2) | (b_4bit >> 4)
-            b = b.to(tl.uint16).to(tl.float16, bitcast=True)
+        # else:
+        #     #        sign bit     |    first exponent bit    | 2 exponent bits and 2 mantissa bits
+        #     b = (b_2bit & 0x8000) | ((b_2bit & 0x4000) >> 2) | (b_4bit >> 4)
+        #     b = b.to(tl.uint16).to(tl.float16, bitcast=True)
+
+        # 4-way parallel
+        # 0000 1111 2222 3333
+        # ____ 0000 ____ 1111 ____ 2222 ____ 3333
+        b_4bit_01, b_4bit_23 = b_4bit.reshape(BLOCK_K, BLOCK_N // 4, 2).split()
+        b_4bit = ((b_4bit_01 & 0xf0) << 20) | ((b_4bit_01 & 0x0f) << 16) | ((b_4bit_23 & 0xf0) << 4) | (b_4bit_23 & 0x0f)
+
+        # b_4bit = ((b_4bit & 0xf000) << 12) | ((b_4bit & 0x0f00) << 8) | ((b_4bit & 0x00f0) << 4) | (b_4bit & 0x000f)
+
+        # 0011 2233
+        # 00__ ____ 11__ ____ 22__ ____ 33__ ____
+        # 0__0 ____ 1__1 ____ 2__2 ____ 3__3 ____
+        b_2bit = ((b_2bit & 0xc0) << 24) | ((b_2bit & 0x30) << 18) | ((b_2bit & 0x0c) << 12) | ((b_2bit & 0x03) << 6)
+        b_2bit = (b_2bit & 0x80808080) | ((b_2bit & 0x40404040) >> 2)
+
+        # 0__0 0000 1__1 1111 2__2 2222 3__3 3333
+        b = b_2bit | b_4bit
+
+        b0 = (b & 0xff000000) >> 16
+        b1 = (b & 0x00ff0000) >> 8
+        b2 = (b & 0x0000ff00)
+        b3 = (b & 0x000000ff) << 8
+        b = tl.interleave(tl.interleave(b0, b2), tl.interleave(b1, b3)).to(tl.uint16).to(tl.float16, bitcast=True)
 
         acc = tl.dot(a, b, acc, out_dtype=ACC_TYPE)
 
         a_ptrs += BLOCK_K * SPLIT_K * stride_ak
         b_2bit_ptrs += BLOCK_K * SPLIT_K * (N // 4)
         b_4bit_ptrs += BLOCK_K * SPLIT_K * (N // 2)
+        # b_4bit_ptrs += BLOCK_K * SPLIT_K * (N // 4)
 
     # rematerialize rm and rn to save registers
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -161,14 +186,14 @@ def float16_float6_e3m2_matmul(A: torch.Tensor, B_2bit: torch.Tensor, B_4bit: to
         M, N, K,
         A.stride(0),
         A.stride(1),
-        BLOCK_M=32,
+        BLOCK_M=16,
         BLOCK_N=32,
-        BLOCK_K=64,
+        BLOCK_K=32,
         SPLIT_K=4,
         GROUP_M=8,
         USE_BFLOAT16=A.dtype is torch.bfloat16,
         num_stages=3,
-        num_warps=8,
+        num_warps=4,
     )
     return C
 

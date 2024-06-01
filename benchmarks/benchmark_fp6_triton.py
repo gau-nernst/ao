@@ -22,7 +22,7 @@ if __name__ == "__main__":
     K = 8192
 
     A = torch.randn(M, K, device="cuda", dtype=torch.half)
-    
+
     linear = torch.nn.Linear(K, N, device="cuda", dtype=torch.half)
     linear_fp6_llm = Fp6LlmLinear.from_float(linear)
 
