@@ -48,8 +48,8 @@ def float16_float6_e3m2_matmul_kernel(
     a_ptr,
     b_2bit_ptr,
     b_4bit_ptr,
-    c_ptr,
     b_scale_ptr,
+    c_ptr,
     # Matrix dimensions
     M,
     N,
@@ -110,13 +110,11 @@ def float16_float6_e3m2_matmul_kernel(
             #        sign bit     |    first exponent bit    | 2 exponent bits and 2 mantissa bits
             b = (b_2bit & 0x8000) | ((b_2bit & 0x4000) >> 5) | (b_4bit >> 7)
             b = b.to(tl.uint16).to(tl.bfloat16, bitcast=True)
-            b *= tl.full((1,), 2.0 ** (127 - 3), dtype=tl.bfloat16)
 
         else:
             #        sign bit     |    first exponent bit    | 2 exponent bits and 2 mantissa bits
             b = (b_2bit & 0x8000) | ((b_2bit & 0x4000) >> 2) | (b_4bit >> 4)
             b = b.to(tl.uint16).to(tl.float16, bitcast=True)
-            b *= tl.full((1,), 2.0 ** (15 - 3), dtype=tl.float16)
 
         acc = tl.dot(a, b, acc, out_dtype=ACC_TYPE)
 
@@ -128,7 +126,12 @@ def float16_float6_e3m2_matmul_kernel(
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
-    b_scale = tl.load(b_scale_ptr + offs_n)
+    b_scale = tl.load(b_scale_ptr + offs_n).to(ACC_TYPE)
+    if USE_BFLOAT16:
+        b_scale *= 2.0 ** (127 - 3)
+    else:
+        b_scale *= 2.0 ** (15 - 3)
+
     acc *= b_scale
 
     c_ptrs = c_ptr + (offs_m[:, None] * N + offs_n[None, :])
@@ -142,18 +145,19 @@ def float16_float6_e3m2_matmul(A: torch.Tensor, B_2bit: torch.Tensor, B_4bit: to
 
     assert A.dtype in (torch.float16, torch.bfloat16)
     assert B_scale.dtype == A.dtype
+    assert B_scale.numel() == N
     assert K % 64 == 0
     assert N % 64 == 0
 
-    C = torch.empty(M, N, device=A.device, dtype=A.dtype)
+    C = torch.zeros(M, N, device=A.device, dtype=A.dtype)
 
     grid = lambda META: (triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']), META["SPLIT_K"])
     float16_float6_e3m2_matmul_kernel[grid](
         A,
         B_2bit,
         B_4bit,
-        C,
         B_scale,
+        C,
         M, N, K,
         A.stride(0),
         A.stride(1),
