@@ -1,7 +1,6 @@
 import torch
 from torchao.quantization.fp6_llm import Fp6LlmLinear
-from torchao.prototype.fp6.fp16_fp6_triton import float16_float6_e3m2_matmul, float16_matmul
-from torchao.dtypes.float6_e3m2 import FLOAT6_E3M2_MAX, to_float6_e3m2
+from torchao.prototype.fp6.fp16_fp6_triton import fp6_2_4_matmul, float16_matmul, to_fp6_2_4
 from torch.utils.benchmark import Timer
 import pandas as pd
 
@@ -27,26 +26,13 @@ if __name__ == "__main__":
     linear_fp6_llm = Fp6LlmLinear.from_float(linear)
 
     B = linear.weight.detach().T.contiguous()
-
-    # for triton kernel
-    B_scale = B.float().abs().amax(0) / FLOAT6_E3M2_MAX
-    B_scale[B_scale == 0.0] = 1.0
-    B_scaled = B / B_scale
-    B_scale = B_scale.to(torch.half)
-    B_6bit = to_float6_e3m2(B_scaled, no_bit_packing=True)
-
-    B_2bit = (B_6bit >> 4) & 0b11
-    B_4bit = B_6bit & 0b1111
-
-    B_2bit = (B_2bit[..., ::4] << 6) | (B_2bit[..., 1::4] << 4) | (B_2bit[..., 2::4] << 2) | B_2bit[..., 3::4]
-    B_4bit = (B_4bit[..., ::2] << 4) | B_4bit[..., 1::2]
-    # end of for triton kernel
+    B_2bit, B_4bit, B_scale = to_fp6_2_4(B)
 
     results = []
     results.append(["Baseline (CuBLAS)", benchmark(torch.matmul, A, B)])
     results.append(["FP16-triton", benchmark(float16_matmul, A, B)])
     results.append(["FP6-LLM", benchmark(linear_fp6_llm, A)])
-    results.append(["FP6-triton-splitK", benchmark(float16_float6_e3m2_matmul, A, B_2bit, B_4bit, B_scale)])
+    results.append(["FP6-triton-splitK", benchmark(fp6_2_4_matmul, A, B_2bit, B_4bit, B_scale)])
 
     df = pd.DataFrame(results, columns=["name", "time (ms)"])
     print(df.to_markdown(index=False))

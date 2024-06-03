@@ -1,6 +1,8 @@
 import torch
+from torch import Tensor
 import triton
 import triton.language as tl
+from torchao.dtypes.float6_e3m2 import FLOAT6_E3M2_MAX, to_float6_e3m2
 
 
 def get_cuda_autotune_config():
@@ -44,7 +46,7 @@ def grouped_launch(pid, M, N, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, GROU
 #     key=['M', 'N', 'K'],
 # )
 @triton.jit
-def float16_float6_e3m2_matmul_kernel(
+def fp6_2_4_matmul_kernel(
     a_ptr,
     b_2bit_ptr,
     b_4bit_ptr,
@@ -164,7 +166,7 @@ def float16_float6_e3m2_matmul_kernel(
     tl.atomic_add(c_ptrs, acc, mask)
 
 
-def float16_float6_e3m2_matmul(A: torch.Tensor, B_2bit: torch.Tensor, B_4bit: torch.Tensor, B_scale: torch.Tensor) -> torch.Tensor:
+def fp6_2_4_matmul(A: torch.Tensor, B_2bit: torch.Tensor, B_4bit: torch.Tensor, B_scale: torch.Tensor) -> torch.Tensor:
     M, K = A.shape
     N = B_2bit.shape[1] * 4
 
@@ -177,7 +179,7 @@ def float16_float6_e3m2_matmul(A: torch.Tensor, B_2bit: torch.Tensor, B_4bit: to
     C = torch.zeros(M, N, device=A.device, dtype=A.dtype)
 
     grid = lambda META: (triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']), META["SPLIT_K"])
-    float16_float6_e3m2_matmul_kernel[grid](
+    fp6_2_4_matmul_kernel[grid](
         A,
         B_2bit,
         B_4bit,
@@ -196,6 +198,113 @@ def float16_float6_e3m2_matmul(A: torch.Tensor, B_2bit: torch.Tensor, B_4bit: to
         num_warps=4,
     )
     return C
+
+
+def to_fp6_2_4(x: Tensor):
+    scale = x.float().abs().amax(0) / FLOAT6_E3M2_MAX
+    scale[scale == 0.0] = 1.0
+    scaled_x = x / scale
+    scale = scale.to(torch.half)
+    x_6bit = to_float6_e3m2(scaled_x, no_bit_packing=True)
+
+    x_2bit = (x_6bit >> 4) & 0b11
+    x_4bit = x_6bit & 0b1111
+
+    # packing
+    x_2bit = (x_2bit[..., ::4] << 6) | (x_2bit[..., 1::4] << 4) | (x_2bit[..., 2::4] << 2) | x_2bit[..., 3::4]
+    x_4bit = (x_4bit[..., ::2] << 4) | x_4bit[..., 1::2]
+    return x_2bit, x_4bit, scale
+
+
+@triton.jit
+def fp6_2_4_matmul_kernel(
+    a_ptr,
+    b_ptr,
+    b_scale_ptr,
+    c_ptr,
+    # Matrix dimensions
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    # Meta-parameters
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    ACC_TYPE: tl.constexpr = tl.float32,
+    USE_BFLOAT16: tl.constexpr = False,
+):
+    pid = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    grid_k = tl.cdiv(K, BLOCK_K * SPLIT_K)
+
+    pid_m, pid_n = grouped_launch(pid, M, N, BLOCK_M, BLOCK_N, GROUP_M)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    # offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+
+    offs_am = tl.max_contiguous(tl.multiple_of(offs_m, BLOCK_M), BLOCK_M)
+    # offs_bn = tl.max_contiguous(tl.multiple_of(offs_n, BLOCK_N), BLOCK_N)
+
+    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+
+    # 4 FP6 is packed into 3 uint8
+    b_offs = offs_k[:, None] * (N // 4 * 3) + (pid_n * (BLOCK_N // 4 * 3))[None, :]
+    b_ptrs = b_ptr + b_offs
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+    for _ in range(0, grid_k):
+        a = tl.load(a_ptrs)
+        
+        # strided memory load, since we can't index data in shared memory
+        b_byte0 = tl.load(b_ptrs + (tl.arange(0, BLOCK_N // 4)[None, :] * 3))
+        b_byte1 = tl.load(b_ptrs + (tl.arange(0, BLOCK_N // 4)[None, :] * 3 + 1))
+        b_byte2 = tl.load(b_ptrs + (tl.arange(0, BLOCK_N // 4)[None, :] * 3 + 2))
+
+        b0 = b_byte0 >> 2
+        b1 = ((b_byte0 & 0b11) << 4) | (b_byte1 >> 4)
+        b2 = ((b_byte1 & 0b1111) << 2) | (b_byte2 >> 6)
+        b3 = b_byte2 & 0b111111
+
+        acc = tl.dot(a, b, acc, out_dtype=ACC_TYPE)
+
+        a_ptrs += BLOCK_K * SPLIT_K * stride_ak
+        b_ptrs += BLOCK_K * SPLIT_K * (N // 4 * 3)
+
+    # rematerialize rm and rn to save registers
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    b_scale = tl.load(b_scale_ptr + offs_n).to(ACC_TYPE)
+    if USE_BFLOAT16:
+        b_scale *= 2.0 ** (127 - 3)
+    else:
+        b_scale *= 2.0 ** (15 - 3)
+
+    acc *= b_scale
+
+    c_ptrs = c_ptr + (offs_m[:, None] * N + offs_n[None, :])
+    mask = (offs_m < M)[:, None] & (offs_n < N)[None, :]
+    tl.atomic_add(c_ptrs, acc, mask)
+
+
+def to_fp6_packed(x: Tensor):
+    scale = x.float().abs().amax(0) / FLOAT6_E3M2_MAX
+    scale[scale == 0.0] = 1.0
+    scaled_x = x / scale
+    scale = scale.to(torch.half)
+    x_6bit = to_float6_e3m2(scaled_x, no_bit_packing=True)
+
+    byte0 = (x_6bit[..., ::4] << 2) | (x_6bit[..., 1::4] >> 4)    # 0000 0011
+    byte1 = (x_6bit[..., 1::4] << 4) | (x_6bit[..., 2::4] >> 2)   # 1111 2222
+    byte2 = (x_6bit[..., 2::4] << 6) | x_6bit[..., 3::4]          # 2233 3333
+    packed_x = torch.stack([byte0, byte1, byte2], dim=-1).flatten(-2)
+
+    return packed_x, scale
 
 
 @triton.autotune(
