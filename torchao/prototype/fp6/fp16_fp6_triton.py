@@ -159,6 +159,7 @@ def fp6_2_4_matmul_kernel(
         #     b = (b_2bit & 0x8000) | ((b_2bit & 0x4000) >> 2) | (b_4bit >> 4)
         #     b = b.to(tl.uint16).to(tl.float16, bitcast=True)
 
+        # TODO: profile number of registers used
         # 4-way parallel
         # 0000 1111 2222 3333
         # ____ 0000 ____ 1111 ____ 2222 ____ 3333
@@ -176,11 +177,12 @@ def fp6_2_4_matmul_kernel(
         # 0__0 0000 1__1 1111 2__2 2222 3__3 3333
         b = b_2bit | b_4bit
 
-        b0 = (b & 0xff000000) >> 16
-        b1 = (b & 0x00ff0000) >> 8
-        b2 = (b & 0x0000ff00)
-        b3 = (b & 0x000000ff) << 8
-        b = tl.interleave(tl.interleave(b0, b2), tl.interleave(b1, b3)).to(tl.uint16).to(tl.float16, bitcast=True)
+        b0 = ((b & 0xff000000) >> 16).to(tl.uint16)
+        b1 = ((b & 0x00ff0000) >> 8).to(tl.uint16)
+        b2 = (b & 0x0000ff00).to(tl.uint16)
+        b3 = ((b & 0x000000ff) << 8).to(tl.uint16)
+        b = tl.interleave(tl.interleave(b0, b2), tl.interleave(b1, b3))
+        b = b.to(tl.float16, bitcast=True)
 
         acc = tl.dot(a, b, acc, out_dtype=ACC_TYPE)
 
