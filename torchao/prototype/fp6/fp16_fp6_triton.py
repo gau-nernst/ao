@@ -2,29 +2,72 @@ import torch
 from torch import Tensor
 import triton
 import triton.language as tl
+from triton import Config
 from torchao.dtypes.float6_e3m2 import FLOAT6_E3M2_MAX, to_float6_e3m2
 
 
 def get_cuda_autotune_config():
     return [
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=5, num_warps=2),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=5, num_warps=2),
+        Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+        Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+        Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+        Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+        Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+        Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+        Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=5, num_warps=2),
+        Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=5, num_warps=2),
         # Good config for fp8 inputs.
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+        Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+        Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+        Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+        Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+        Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+        Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+        Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+        Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
     ]
+
+def init_to_zero(name):
+    return lambda nargs: nargs[name].zero_()
+
+
+# from HQQ kernel
+def get_configs_io_bound():
+    configs = []
+    for num_stages in [2, 3, 4, 5, 6]:
+        for block_m in [16, 32]:
+            for block_k in [32, 64]:
+                for block_n in [32, 64, 128, 256]:
+                    num_warps = 2 if block_n <= 64 else 4
+                    configs.append(
+                        Config(
+                            {
+                                "BLOCK_M": block_m,
+                                "BLOCK_N": block_n,
+                                "BLOCK_K": block_k,
+                                "SPLIT_K": 1,
+                            },
+                            num_stages=num_stages,
+                            num_warps=num_warps,
+                        )
+                    )
+                    # split_k
+                    for split_k in [2, 4, 8, 16]:
+                        configs.append(
+                            Config(
+                                {
+                                    "BLOCK_M": block_m,
+                                    "BLOCK_N": block_n,
+                                    "BLOCK_K": block_k,
+                                    "SPLIT_K": split_k,
+                                },
+                                num_stages=num_stages,
+                                num_warps=num_warps,
+                                pre_hook=init_to_zero("c_ptr"),
+                            )
+                        )
+    return configs
+
 
 @triton.jit
 def grouped_launch(pid, M, N, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, GROUP_M: tl.constexpr):
@@ -41,10 +84,7 @@ def grouped_launch(pid, M, N, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, GROU
     return pid_m, pid_n
 
 
-# @triton.autotune(
-#     configs=get_cuda_autotune_config2(),
-#     key=['M', 'N', 'K'],
-# )
+@triton.autotune(configs=get_configs_io_bound(), key=["M", "N", "K"])
 @triton.jit
 def fp6_2_4_matmul_kernel(
     a_ptr,
@@ -188,14 +228,8 @@ def fp6_2_4_matmul(A: torch.Tensor, B_2bit: torch.Tensor, B_4bit: torch.Tensor, 
         M, N, K,
         A.stride(0),
         A.stride(1),
-        BLOCK_M=16,
-        BLOCK_N=32,
-        BLOCK_K=32,
-        SPLIT_K=4,
         GROUP_M=8,
         USE_BFLOAT16=A.dtype is torch.bfloat16,
-        num_stages=3,
-        num_warps=4,
     )
     return C
 
@@ -217,7 +251,7 @@ def to_fp6_2_4(x: Tensor):
 
 
 @triton.jit
-def fp6_2_4_matmul_kernel(
+def fp6_packed_matmul_kernel(
     a_ptr,
     b_ptr,
     b_scale_ptr,
