@@ -1,11 +1,12 @@
 import torch
 from torchao.quantization.subclass import QuantizedLinearWeightBase
+from torch import nn
 
 
 class Fp8E5M2WeightOnlyQuantizedLinearWeight(QuantizedLinearWeightBase):
     @staticmethod
     def _quantized_op(act_mat, w_qtensor, bias):
-        y = torch.mm(act_mat.flatten(0, -2), w_qtensor.int_data.T.to(act_mat.dtype))
+        y = torch.mm(act_mat.flatten(0, -2), w_qtensor.int_data.to(act_mat.dtype))
         y = y.reshape(*act_mat.shape[:-1], y.shape[-1])
         if bias is not None:
             y += bias
@@ -13,7 +14,8 @@ class Fp8E5M2WeightOnlyQuantizedLinearWeight(QuantizedLinearWeightBase):
 
     @classmethod
     def from_float(cls, input_float):
-        return cls(input_float.to(torch.float8_e5m2), False, input_float.shape, dtype=input_float.dtype)
+        int_data = input_float.T.to(torch.float8_e5m2).contiguous()
+        return cls(int_data, False, input_float.shape, dtype=input_float.dtype)
 
     def _apply_fn_to_data(self, fn):
         return self.__class__(
@@ -22,6 +24,9 @@ class Fp8E5M2WeightOnlyQuantizedLinearWeight(QuantizedLinearWeightBase):
             self.shape,
             dtype=self.dtype,
         )
+
+    def _change_shape(self, shape):
+        return self.__class__(self.int_data, self.transposed, shape, dtype=self.dtype)
 
     def __tensor_flatten__(self):
         return ["int_data"], (self.transposed, self.shape, self.dtype)
@@ -37,3 +42,12 @@ class Fp8E5M2WeightOnlyQuantizedLinearWeight(QuantizedLinearWeightBase):
             dtype=dtype,
             strides=outer_stride,
         )
+
+
+def change_linear_weights_to_fp8e5m2_woqtensors(model):
+    for m in model.modules():
+        if isinstance(m, nn.Linear):
+            m.weight = nn.Parameter(
+                Fp8E5M2WeightOnlyQuantizedLinearWeight.from_float(m.weight.data),
+                requires_grad=False,
+            )
