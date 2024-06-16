@@ -5,6 +5,7 @@ from functools import reduce
 from math import gcd
 from packaging import version
 import torch.nn.utils.parametrize as parametrize
+import itertools
 
 __all__ = [
     "benchmark_model",
@@ -82,14 +83,31 @@ def find_multiple(n: int, *args: Tuple[int]) -> int:
         return n
     return n + k - (n % k)
 
-# https://discuss.pytorch.org/t/finding-model-size/130275
-def get_model_size_in_bytes(model):
-    s = 0
-    for p in model.parameters():
-        s += p.nelement() * p.element_size()
-    for b in model.buffers():
-        s += b.nelement() * b.element_size()
-    return s
+def get_model_size_in_bytes(model, ignore_embeddings=False):
+    """
+    Returns the model size in bytes. The option to ignore embeddings
+    is useful for models with disproportionately large embeddings compared
+    to other model parameters that get quantized/sparsified.
+    """
+    def flat_size(tensor):
+        if hasattr(tensor, "__tensor_flatten__"):
+            size = 0
+            # 0th element is a list of attributes that
+            # hold tensors
+            for attr_name in tensor.__tensor_flatten__()[0]:
+                sub_tensor = getattr(tensor, attr_name)
+                size += flat_size(sub_tensor)
+            return size
+        else:
+            return tensor.numel() * tensor.element_size()
+
+    model_size = 0
+    for name, child in model.named_children():
+        if not (isinstance(child, torch.nn.Embedding) and ignore_embeddings):
+            for p in itertools.chain(child.parameters(recurse=False), child.buffers(recurse=False)):
+                model_size += flat_size(p)
+            model_size += get_model_size_in_bytes(child, ignore_embeddings)
+    return model_size
 
 class UnwrapTensorSubclass(torch.nn.Module):
     def forward(self, *tensors):
@@ -126,6 +144,11 @@ class UnwrapTensorSubclass(torch.nn.Module):
         return plain_tensors
 
 def unwrap_tensor_subclass(model, filter_fn=None):
+    """Unwraps (nested) tensor subclass in the model to plain tensors
+    This is a workaround to make a model with tensor subclass to work with `torch.export.export`
+    and `torch.aot_compile`, we hope this can be integrated into compile stack soon
+    tracking issue: https://github.com/pytorch/ao/issues/345
+    """
     for name, child in model.named_children():
         # make sure child.weight is a tensor subclass
         if (
@@ -154,3 +177,6 @@ if version.parse(torch.__version__) >= version.parse("2.2.0.dev"):
     TORCH_VERSION_AFTER_2_2 = True
 else:
     TORCH_VERSION_AFTER_2_2 = False
+
+def is_fbcode():
+    return not hasattr(torch.version, "git_version")

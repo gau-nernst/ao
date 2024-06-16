@@ -15,6 +15,9 @@ def read_requirements(file_path):
     with open(file_path, "r") as file:
         return file.read().splitlines()
 
+def read_version(file_path="version.txt"):
+    with open(file_path, "r") as file:
+        return file.readline().strip()
 
 # Determine the package name based on the presence of an environment variable
 package_name = "torchao-nightly" if os.environ.get("TORCHAO_NIGHTLY") else "torchao"
@@ -23,7 +26,7 @@ use_cpp = os.getenv('USE_CPP')
 
 
 # Version is year.month.date if using nightlies
-version = current_date if package_name == "torchao-nightly" else "0.2.0"
+version = current_date if package_name == "torchao-nightly" else read_version()
 
 import torch
 
@@ -85,6 +88,16 @@ def get_extensions():
 
     return ext_modules
 
+# Mimic code from torchvision https://github.com/pytorch/vision/blob/143d078b28f00471156a4e562dd3836370acc9ee/setup.py#L58
+pytorch_dep = "torch"
+if os.getenv("PYTORCH_VERSION"):
+    pytorch_dep += "==" + os.getenv("PYTORCH_VERSION")
+
+requirements = [
+    "numpy",
+    pytorch_dep,
+]
+
 setup(
     name=package_name,
     version=version+version_suffix,
@@ -94,7 +107,7 @@ setup(
         "torchao.kernel.configs": ["*.pkl"],
     },
     ext_modules=get_extensions() if use_cpp != "0" else None,
-    install_requires=read_requirements("requirements.txt"),
+    install_requires=requirements,
     extras_require={"dev": read_requirements("dev-requirements.txt")},
     description="Package for applying ao techniques to GPU models",
     long_description=open("README.md").read(),
