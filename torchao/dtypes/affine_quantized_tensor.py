@@ -1,8 +1,5 @@
 import torch
-from typing import Tuple, Optional, Union, List
-import torchao.ops
-from collections import defaultdict
-import functools
+from typing import Tuple, Optional, Union
 import math
 from torchao.quantization.quant_primitives import (
     _get_reduction_params,
@@ -17,9 +14,6 @@ from torchao.quantization.quant_primitives import (
     choose_qparams_affine_floatx,
     quantize_affine_floatx,
     dequantize_affine_floatx,
-)
-from torchao.quantization.utils import (
-    pack_tinygemm_scales_and_zeros,
 )
 from torch.utils._python_dispatch import return_and_correct_aliasing
 from torchao.dtypes.utils import (
@@ -1813,6 +1807,44 @@ def _(func, types, args, kwargs):
         if isinstance(weight_tensor, AffineQuantizedTensor):
             weight_tensor = weight_tensor.dequantize()
         return func(input_tensor, weight_tensor)
+
+
+@implements(torch.nn.functional.conv2d)
+def _(func, types, args, kwargs):
+    input_tensor, weight_tensor, bias, stride, padding, dilation, groups = args
+
+    # TODO: check correct quantization block_size
+    if (
+        isinstance(input_tensor, AffineQuantizedTensor)
+        and isinstance(input_tensor.layout_tensor, PlainLayoutType)
+        and input_tensor.is_cuda
+        and isinstance(weight_tensor, AffineQuantizedTensor)
+        and isinstance(weight_tensor.layout_tensor, PlainLayoutType)
+        and weight_tensor.is_cuda
+        and dilation == (1, 1)
+        and groups == 1
+    ):
+        from torchao.kernel.scaled_int8_conv2d import scaled_int8_conv2d
+
+        out = scaled_int8_conv2d(
+            X=input_tensor.layout_tensor.int_data,
+            W=weight_tensor.layout_tensor.int_data,
+            batch_scale=input_tensor.layout_tensor.scale,
+            channel_scale=weight_tensor.layout_tensor.scale,
+            stride=stride,
+            padding=padding
+        )
+        if bias is not None:
+            out += bias.view(-1, 1, 1)
+        return out
+    
+    # fallback
+    if isinstance(input_tensor, AffineQuantizedTensor):
+        input_tensor = input_tensor.dequantize()
+    if isinstance(weight_tensor, AffineQuantizedTensor):
+        weight_tensor = weight_tensor.dequantize()
+    return func(input_tensor, weight_tensor, bias, stride, padding, dilation, groups)
+
 
 @implements(aten.detach.default)
 def _(func, types, args, kwargs):

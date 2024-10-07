@@ -910,6 +910,50 @@ def fpx_weight_only(ebits: int, mbits: int):
     return _get_linear_subclass_inserter(apply_quant_llm)
 
 
+def conv2d_int8_dynamic_activation_int8_weight(layout_type=PlainLayoutType()):
+    """
+    Applies int8 dynamic symmetric per-image activation and int8 per-channel weight
+    quantization to conv2d layers
+    """
+    def apply_conv2d_int8_dynamic_activation_int8_weight_quant(weight):
+        in_features = weight.shape[1]
+        # copied from int8da
+        # int8 dynamic quantization only has benefit when in_feature > 16
+        if in_features <= 16:
+            logger.info(
+                f"Skipping applying conv2d_int8_dynamic_activation_int8_weight to weight of shape {weight.shape}"
+                f" because `in_feature` is <= 16: {in_features}")
+            return weight
+
+        # TODO: skip if kernel_size=(1,1) (or we should dispatch to int8_dynamic_activation_int8_weight?)
+
+        # weight settings
+        mapping_type = MappingType.SYMMETRIC
+        target_dtype = torch.int8
+        eps = torch.finfo(torch.float32).eps
+        zero_point_dtype = torch.int64
+        block_size = (1, *weight.shape[1:])
+
+        # input settings
+        # same as _int8_symm_per_token_reduced_range_quant()
+        def input_quant_func(x: torch.Tensor) -> torch.Tensor:
+            return to_affine_quantized_intx(
+                x,
+                mapping_type=MappingType.SYMMETRIC,
+                block_size=(1, *x.shape[1:]),
+                target_dtype=torch.int8,
+                quant_min=-127,
+                quant_max=127,
+                eps=1e-5,
+            )
+
+        weight = to_affine_quantized_intx(weight, mapping_type, block_size, target_dtype, eps=eps, zero_point_dtype=zero_point_dtype, layout_type=layout_type)
+        weight = to_linear_activation_quantized(weight, input_quant_func)
+        return weight
+
+    return _get_linear_subclass_inserter(apply_conv2d_int8_dynamic_activation_int8_weight_quant)
+
+
 if TORCH_VERSION_AT_LEAST_2_5:
     torch.serialization.add_safe_globals(
         [

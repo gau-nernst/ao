@@ -72,6 +72,13 @@ class LinearActivationQuantizedTensor(TorchAOBaseTensor):
         aqt = input_quant_func(input_tensor)
         return torch.nn.functional.linear(aqt, original_weight_tensor, bias)
 
+    @staticmethod
+    def _quantized_conv2d_op(input_tensor, weight_tensor, bias, stride, padding, dilation, groups):
+        input_quant_func = weight_tensor.input_quant_func
+        original_weight_tensor = weight_tensor.original_weight_tensor
+        aqt = input_quant_func(input_tensor)
+        return torch.nn.functional.conv2d(aqt, original_weight_tensor, bias, stride, padding, dilation, groups)
+
     @classmethod
     def from_float(cls, input_float, input_quant_func):
         return cls(input_float, input_quant_func)
@@ -136,6 +143,15 @@ def _(func, types, args, kwargs):
         original_weight_tensor = weight_tensor.original_weight_tensor
         aqt = input_quant_func(input_tensor)
         return func(aqt, original_weight_tensor)
+
+
+@implements([torch.nn.functional.conv2d])
+def _(func, types, args, kwargs):
+    weight = args[1]
+    if isinstance(weight, LinearActivationQuantizedTensor):
+        return weight._quantized_conv2d_op(*args)
+
+    raise NotImplementedError("LinearActivationQuantizedTensor: No specialized dispatch found for linear op")
 
 
 @implements(aten.detach.default)
