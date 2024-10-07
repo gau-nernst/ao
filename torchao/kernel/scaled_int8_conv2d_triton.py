@@ -52,6 +52,7 @@ configs = [
 def _scaled_int8_conv2d_kernel(
     X_ptr,
     W_ptr,
+    batch_scale_ptr,  # shape (BATCH,)
     channel_scale_ptr,  # shape (OUT_C,)
     out_ptr,
     # Tensor dimensions
@@ -142,9 +143,9 @@ def _scaled_int8_conv2d_kernel(
     idx_w = idx_y_w[:, None]
 
     # new epilogue here
-    # TODO: add per-sample X_scale
+    batch_scale = tl.load(batch_scale_ptr + idx_n).to(tl.float32)
     channel_scale = tl.load(channel_scale_ptr + idx_c).to(tl.float32)
-    acc = acc.to(tl.float32) * channel_scale
+    acc = acc.to(tl.float32) * batch_scale * channel_scale
 
     out_ptr_offsets = tl.broadcast_to(
         idx_n * stride_outn + idx_c * stride_outc + idx_h * stride_outh + idx_w * stride_outw, acc.shape
@@ -155,6 +156,7 @@ def _scaled_int8_conv2d_kernel(
 def scaled_int8_conv2d_triton(
     X: Tensor,
     W: Tensor,
+    batch_scale: Tensor,
     channel_scale: Tensor,
     stride: tuple[int, int] = (1, 1),
     padding: tuple[int, int] = (0, 0),
@@ -185,6 +187,7 @@ def scaled_int8_conv2d_triton(
     _scaled_int8_conv2d_kernel[grid](
         X,
         W,
+        batch_scale,
         channel_scale,
         out,
         BATCH,

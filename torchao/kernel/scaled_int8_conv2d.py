@@ -4,13 +4,16 @@ from torch.utils._triton import has_triton
 
 
 lib = torch.library.Library("torchao", "FRAGMENT")
-lib.define("scaled_int8_conv2d(Tensor X, Tensor W, Tensor channel_scale, int[2] stride, int[2] padding) -> Tensor")
+lib.define(
+    "scaled_int8_conv2d(Tensor X, Tensor W, Tensor batch_scale, Tensor channel_scale, int[2] stride, int[2] padding) -> Tensor"
+)
 
 
 @torch.library.impl(lib, "scaled_int8_conv2d", "Meta")
 def _(
     X: Tensor,
     W: Tensor,
+    batch_scale: Tensor,
     channel_scale: Tensor,
     stride: tuple[int, int],
     padding: tuple[int, int],
@@ -43,6 +46,7 @@ if has_triton():
 def scaled_int8_conv2d(
     X: Tensor,
     W: Tensor,
+    batch_scale: Tensor,
     channel_scale: Tensor,
     stride: int | tuple[int, int] = 1,
     padding: int | tuple[int, int] = 0,
@@ -50,9 +54,11 @@ def scaled_int8_conv2d(
     assert X.dtype == W.dtype == torch.int8
     assert X.is_contiguous(memory_format=torch.channels_last)
     assert W.is_contiguous(memory_format=torch.channels_last)
+    assert batch_scale.is_contiguous()
     assert channel_scale.is_contiguous()
     out_channels, in_channels, _, _ = W.shape
     assert X.shape[1] == in_channels
+    assert batch_scale.shape[0] == X.shape[0]
     assert channel_scale.shape[0] == out_channels
 
-    return torch.ops.torchao.scaled_int8_conv2d(X, W, channel_scale, stride, padding)
+    return torch.ops.torchao.scaled_int8_conv2d(X, W, batch_scale, channel_scale, stride, padding)
