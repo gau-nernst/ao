@@ -18,9 +18,9 @@ else:
     # This is less performant than the explicit hand-written Triton kernel, though things might
     # change in the future. This also assumes A and B are INT8, while the Triton kernel will
     # also work with FP8.
-    # Multiplying col_scale first is faster than the other way round.
-    def scaled_mm(A: Tensor, B: Tensor, row_scale: Tensor, col_scale: Tensor) -> Tensor:
-        return torch._int_mm(A, B) * col_scale.view(-1) * row_scale.view(-1, 1)
+    # Multiplying col_scale (scale_B) first is faster than the other way round.
+    def scaled_mm(A: Tensor, B: Tensor, scale_A: Tensor, scale_B: Tensor) -> Tensor:
+        return torch._int_mm(A, B) * scale_B * scale_A
 
 
 class Int8MixedPrecisionTrainingConfig(NamedTuple):
@@ -188,8 +188,8 @@ def _dynamic_int8_mm(A: Tensor, B: Tensor) -> Tensor:
     out = scaled_mm(
         A_i8.contiguous(),
         B_t_i8.contiguous().T,
-        A_scale_rowwise.contiguous(),
-        B_scale_colwise.contiguous(),
+        A_scale_rowwise.contiguous().unsqueeze(1),
+        B_scale_colwise.contiguous().unsqueeze(0),
     )
     return out.view(*A.shape[:-1], out.shape[-1])
 

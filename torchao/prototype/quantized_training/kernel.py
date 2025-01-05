@@ -126,25 +126,132 @@ def _scaled_mm_kernel(
     tl.store(C_ptr + tl.broadcast_to(xindex, mask.shape), acc, mask)
 
 
-lib.define("scaled_mm(Tensor A, Tensor B, Tensor A_scale, Tensor B_scale) -> Tensor")
+@triton.autotune(configs=configs, key=["M", "N", "K", "stride_ak", "stride_bk"])
+@triton.jit
+def _tile_scaled_mm_kernel(
+    A_ptr,  # (M, K)
+    B_ptr,  # (K, N)
+    C_ptr,  # (M, N)
+    scale_A_ptr,  # (M // QUANT_BLOCK_M, K // QUANT_BLOCK_K)
+    scale_B_ptr,  # (K // QUANT_BLOCK_K, N // QUANT_BLOCK_N)
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_scale_am,
+    stride_scale_ak,
+    stride_scale_bk,
+    stride_scale_bn,
+    QUANT_BLOCK_M: tl.constexpr,
+    QUANT_BLOCK_N: tl.constexpr,
+    QUANT_BLOCK_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    ACC_DTYPE: tl.constexpr,
+    GROUP_M: tl.constexpr = 8,
+    EVEN_K: tl.constexpr = True,
+):
+    tl.static_assert(QUANT_BLOCK_K % BLOCK_K == 0)
+
+    # based on triton.ops.matmul
+    pid = tl.program_id(0)
+    grid_m = (M + BLOCK_M - 1) // BLOCK_M
+    grid_n = (N + BLOCK_N - 1) // BLOCK_N
+
+    # re-order program ID for better L2 performance
+    width = GROUP_M * grid_n
+    group_id = pid // width
+    group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
+    pid_m = group_id * GROUP_M + (pid % group_size)
+    pid_n = (pid % width) // (group_size)
+
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
+    rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
+    rk = tl.arange(0, BLOCK_K)
+    A = A_ptr + (ram[:, None] * stride_am + rk[None, :] * stride_ak)
+    B = B_ptr + (rk[:, None] * stride_bk + rbn[None, :] * stride_bn)
+
+    A_scale = scale_A_ptr + ((rm // QUANT_BLOCK_M)[:, None] * stride_scale_am)
+    B_scale = scale_B_ptr + ((rn // QUANT_BLOCK_N)[None, :] * stride_scale_bn)
+
+    # we use 2 accumulators. acc is the final result. mma_acc is accumulator for MMA before
+    # scaling. for every QUANT_BLOCK_K, we will scale mma_acc and accumulate it to acc.
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    mma_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
+    for k in range(K, 0, -BLOCK_K):
+        if EVEN_K:
+            a = tl.load(A)
+            b = tl.load(B)
+        else:
+            a = tl.load(A, mask=rk[None, :] < k, other=0.0)
+            b = tl.load(B, mask=rk[:, None] < k, other=0.0)
+        mma_acc += tl.dot(a, b)
+        A += BLOCK_K * stride_ak
+        B += BLOCK_K * stride_bk
+
+        if (k - BLOCK_K) % QUANT_BLOCK_K == 0:
+            a_scale = tl.load(A_scale).to(tl.float32)
+            b_scale = tl.load(B_scale).to(tl.float32)
+            acc += mma_acc.to(tl.float32) * a_scale * b_scale
+            mma_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
+            A_scale += stride_scale_ak
+            B_scale += stride_scale_bk
+
+    # rematerialize rm and rn to save registers
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    idx_m = rm[:, None]
+    idx_n = rn[None, :]
+    mask = (idx_m < M) & (idx_n < N)
+
+    # inductor generates a suffix
+    xindex = idx_m * stride_cm + idx_n * stride_cn
+    tl.store(C_ptr + tl.broadcast_to(xindex, mask.shape), acc, mask)
 
 
-def scaled_mm(A: Tensor, B: Tensor, row_scale: Tensor, col_scale: Tensor) -> Tensor:
-    """Compute `(A @ B) * row_scale * col_scale`, where `A` and `B` are both INT8 or FP8
-    to utilize INT8/FP8 tensor cores. `col_scale` can be a scalar.
+lib.define("scaled_mm(Tensor A, Tensor B, Tensor scale_A, Tensor scale_B) -> Tensor")
+lib.define("tile_scaled_mm(Tensor A, Tensor B, Tensor scale_A, Tensor scale_B) -> Tensor")
+
+
+def scaled_mm(A: Tensor, B: Tensor, scale_A: Tensor, scale_B: Tensor) -> Tensor:
+    """Matmul for tile-wise quantized A and B. `A` and `B` are both INT8 or FP8 to utilize
+    INT8/FP8 tensor cores. `scale_A` and `scaled_B` are quantization scales for A and B
+    respectively with appropriate shapes.
+
+    E.g.
+      - if `A` is quantized with tile shape (128, 64), `scale_A`'s shape will be
+    `(A.shape[0] / 128, A.shape[1] / 64)`.
+      - if `A` is row-wise quantized, `scale_A`'s shape will be `(A.shape[0], 1)`.
     """
-    assert row_scale.dtype == col_scale.dtype
+    _f8 = (torch.float8_e4m3fn, torch.float8_e5m2)
+    assert (A.dtype == B.dtype == torch.int8) or (A.dtype in _f8 and B.dtype in _f8)
+    assert scale_A.dtype == scale_B.dtype
+    assert A.ndim == B.ndim == scale_A.ndim == scale_B.ndim == 2
     assert A.shape[1] == B.shape[0]
-    assert row_scale.squeeze().shape == (A.shape[0],)
-    assert col_scale.squeeze().shape in ((B.shape[1],), ())
-    assert row_scale.is_contiguous()
-    assert col_scale.is_contiguous()
-    return torch.ops.torchao.scaled_mm(A, B, row_scale, col_scale)
+
+    # row-scale + col-scale or row-scale + tensor-scale
+    if scale_A.shape == (A.shape[0], 1) and scale_B.shape in ((1, B.shape[1]), (1, 1)):
+        assert scale_A.is_contiguous()
+        assert scale_B.is_contiguous()
+        return torch.ops.torchao.scaled_mm(A, B, scale_A, scale_B)
+
+    # generic tile-wise scaling
+    assert scale_A.shape[1] == scale_B.shape[0]
+    return torch.ops.torchao.tile_scaled_mm(A, B, scale_A, scale_B)
 
 
 @torch.library.impl(lib, "scaled_mm", "Meta")
-def _(A: Tensor, B: Tensor, row_scale: Tensor, col_scale: Tensor):
-    return torch.empty((A.shape[0], B.shape[1]), device=A.device, dtype=row_scale.dtype)
+@torch.library.impl(lib, "tile_scaled_mm", "Meta")
+def _(A: Tensor, B: Tensor, scale_A: Tensor, scale_B: Tensor):
+    return torch.empty((A.shape[0], B.shape[1]), device=A.device, dtype=scale_A.dtype)
 
 
 @torch.library.impl(lib, "scaled_mm", "CUDA")
@@ -168,5 +275,34 @@ def scaled_mm_cuda(A: Tensor, B: Tensor, row_scale: Tensor, col_scale: Tensor):
         ACC_DTYPE=tl.int32 if A.dtype == torch.int8 else tl.float32,
         EVEN_K=K % 2 == 0,
         COL_SCALE_SCALAR=col_scale.numel() == 1,
+    )
+    return C
+
+
+@torch.library.impl(lib, "tile_scaled_mm", "CUDA")
+def tile_scaled_mm_cuda(A: Tensor, B: Tensor, scale_A: Tensor, scale_B: Tensor):
+    M, K = A.shape
+    _, N = B.shape
+    C = torch.empty(M, N, device=A.device, dtype=scale_A.dtype)
+    grid = lambda meta: (triton.cdiv(meta["M"], meta["BLOCK_M"]) * triton.cdiv(meta["N"], meta["BLOCK_N"]),)
+    _tile_scaled_mm_kernel[grid](
+        A,
+        B,
+        C,
+        scale_A,
+        scale_B,
+        M,
+        N,
+        K,
+        *A.stride(),
+        *B.stride(),
+        *C.stride(),
+        *scale_A.stride(),
+        *scale_B.stride(),
+        QUANT_BLOCK_M=A.shape[0] // scale_A.shape[0],
+        QUANT_BLOCK_N=B.shape[1] // scale_B.shape[1],
+        QUANT_BLOCK_K=A.shape[1] // scale_A.shape[1],
+        ACC_DTYPE=tl.int32 if A.dtype == torch.int8 else tl.float32,
+        EVEN_K=K % 2 == 0,
     )
     return C
