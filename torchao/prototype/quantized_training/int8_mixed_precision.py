@@ -14,7 +14,6 @@ if has_triton():
     from .kernel import scaled_mm
 
 else:
-
     # This is less performant than the explicit hand-written Triton kernel, though things might
     # change in the future. This also assumes A and B are INT8, while the Triton kernel will
     # also work with FP8.
@@ -62,7 +61,9 @@ class Int8MixedPrecisionTrainingLinearWeight(TorchAOBaseTensor):
         return ["_data"], [self.config]
 
     @classmethod
-    def __tensor_unflatten__(cls, tensor_data_dict, tensor_attributes, outer_size=None, outer_stride=None):
+    def __tensor_unflatten__(
+        cls, tensor_data_dict, tensor_attributes, outer_size=None, outer_stride=None
+    ):
         return cls(tensor_data_dict["_data"], *tensor_attributes)
 
     def __repr__(self):
@@ -156,12 +157,16 @@ def _(func, types, args, kwargs):
 
 
 class Int8MixedPrecisionTrainingLinear(nn.Linear):
-    def __init__(self, *args, config: Int8MixedPrecisionTrainingConfig, **kwargs) -> None:
+    def __init__(
+        self, *args, config: Int8MixedPrecisionTrainingConfig, **kwargs
+    ) -> None:
         super().__init__(*args, **kwargs)
         self.config = config
 
     def forward(self, input: Tensor) -> Tensor:
-        return _Int8MixedPrecisionTrainingLinearFunction.apply(input, self.weight, self.bias, self.config)
+        return _Int8MixedPrecisionTrainingLinearFunction.apply(
+            input, self.weight, self.bias, self.config
+        )
 
 
 def _dynamic_int8_mm(A: Tensor, B: Tensor) -> Tensor:
@@ -247,7 +252,9 @@ class _Int8MixedPrecisionTrainingLinearFunction(torch.autograd.Function):
             input = input.view(-1, weight.shape[1])
             if ctx.config.grad_weight:
                 # grad_weight = _dynamic_int8_mm(grad_output.T, input)
-                grad_weight = _dynamic_int8_mm(input.T, grad_output).T  # this is slightly faster
+                grad_weight = _dynamic_int8_mm(
+                    input.T, grad_output
+                ).T  # this is slightly faster
             else:
                 grad_weight = grad_output.T @ input
 

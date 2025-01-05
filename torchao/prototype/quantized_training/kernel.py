@@ -44,7 +44,11 @@ configs = [
 ]
 
 configs = [
-    triton.Config(dict(BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K), num_stages=num_stages, num_warps=num_warps)
+    triton.Config(
+        dict(BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K),
+        num_stages=num_stages,
+        num_warps=num_warps,
+    )
     for BLOCK_M, BLOCK_N, BLOCK_K, num_stages, num_warps in configs
 ]
 
@@ -218,7 +222,9 @@ def _tile_scaled_mm_kernel(
 
 
 lib.define("scaled_mm(Tensor A, Tensor B, Tensor scale_A, Tensor scale_B) -> Tensor")
-lib.define("tile_scaled_mm(Tensor A, Tensor B, Tensor scale_A, Tensor scale_B) -> Tensor")
+lib.define(
+    "tile_scaled_mm(Tensor A, Tensor B, Tensor scale_A, Tensor scale_B) -> Tensor"
+)
 
 
 def scaled_mm(A: Tensor, B: Tensor, scale_A: Tensor, scale_B: Tensor) -> Tensor:
@@ -259,7 +265,10 @@ def scaled_mm_cuda(A: Tensor, B: Tensor, row_scale: Tensor, col_scale: Tensor):
     M, K = A.shape
     _, N = B.shape
     C = torch.empty(M, N, device=A.device, dtype=row_scale.dtype)
-    grid = lambda meta: (triton.cdiv(meta["M"], meta["BLOCK_M"]) * triton.cdiv(meta["N"], meta["BLOCK_N"]),)
+    grid = lambda meta: (
+        triton.cdiv(meta["M"], meta["BLOCK_M"])
+        * triton.cdiv(meta["N"], meta["BLOCK_N"]),
+    )
     _scaled_mm_kernel[grid](
         A,
         B,
@@ -284,7 +293,10 @@ def tile_scaled_mm_cuda(A: Tensor, B: Tensor, scale_A: Tensor, scale_B: Tensor):
     M, K = A.shape
     _, N = B.shape
     C = torch.empty(M, N, device=A.device, dtype=scale_A.dtype)
-    grid = lambda meta: (triton.cdiv(meta["M"], meta["BLOCK_M"]) * triton.cdiv(meta["N"], meta["BLOCK_N"]),)
+    grid = lambda meta: (
+        triton.cdiv(meta["M"], meta["BLOCK_M"])
+        * triton.cdiv(meta["N"], meta["BLOCK_N"]),
+    )
     _tile_scaled_mm_kernel[grid](
         A,
         B,

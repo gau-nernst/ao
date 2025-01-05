@@ -12,6 +12,7 @@ include = [
     "torchao/_models/**/*.py",
     "torchao/kernel/**/*.py",
     "torchao/prototype/low_bit_optim/**.py",
+    "torchao/prototype/quantized_training/**.py",
     "torchao/utils.py",
     "torchao/ops.py",
     "torchao/_executorch_ops.py",
@@ -20,6 +21,7 @@ include = [
     "test/dtypes/**/*.py",
     "test/sparsity/**/*.py",
     "test/prototype/low_bit_optim/**.py",
+    "test/prototype/test_quantized_training.py",
 ]
 
 lint.select = ["F", "I"]
