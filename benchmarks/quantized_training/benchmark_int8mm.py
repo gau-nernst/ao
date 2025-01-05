@@ -2,7 +2,7 @@ import pandas as pd
 import torch
 from triton.testing import do_bench
 
-from torchao.prototype.quantized_training.int8_mm import int8_mm_dequant
+from torchao.prototype.quantized_training.kernel import scaled_mm
 
 
 def bench_f(f, *args):
@@ -36,10 +36,10 @@ for M, N, K in shapes:
     # benchmark F.linear() i.e. A @ B.T
     bf16_time = bench_f(torch.mm, A_bf16, B_bf16.T)
     i8_time = bench_f(torch._int_mm, A_i8, B_i8.T)
-    i8_dequant_time = bench_f(int8_mm_dequant, A_i8, B_i8.T, A_scale, B_scale)
+    i8_dequant_time = bench_f(scaled_mm, A_i8, B_i8.T, A_scale, B_scale)
 
     sample = [M, N, K, bf16_time / i8_time, bf16_time / i8_dequant_time]
     data.append(sample)
 
-df = pd.DataFrame(data, columns=["M", "N", "K", "CuBLAS INT8 speedup", "Triton INT8 dequant speedup"])
+df = pd.DataFrame(data, columns=["M", "N", "K", "CuBLAS INT8 speedup", "Triton scaled INT8 speedup"])
 print(df.to_markdown())

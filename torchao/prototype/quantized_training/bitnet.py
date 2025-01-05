@@ -18,14 +18,14 @@ from torchao.utils import TorchAOBaseTensor
 from .int8 import quantize_int8_rowwise
 
 if has_triton():
-    from .int8_mm import scaled_int8_mm
+    from .kernel import scaled_mm
 
 else:
 
     # This is less performant than the explicit hand-written Triton kernel, though things might
     # change in the future.
     # Multiplying col_scale first is faster than the other way round.
-    def scaled_int8_mm(A: Tensor, B: Tensor, row_scale: Tensor, col_scale: Tensor) -> Tensor:
+    def scaled_mm(A: Tensor, B: Tensor, row_scale: Tensor, col_scale: Tensor) -> Tensor:
         return torch._int_mm(A, B) * col_scale.view(-1) * row_scale.view(-1, 1)
 
 
@@ -186,7 +186,7 @@ class _BitNetTrainingLinear(torch.autograd.Function):
         ctx.save_for_backward(input_i8, row_scale, weight_i8, tensor_scale)
 
         # use int8 tensor cores
-        out = scaled_int8_mm(input_i8.contiguous(), weight_i8.contiguous().T, row_scale, tensor_scale)
+        out = scaled_mm(input_i8.contiguous(), weight_i8.contiguous().T, row_scale, tensor_scale)
         out = out.view(*batch_dims, weight.shape[0])
 
         out = out + bias if bias is not None else out
@@ -320,7 +320,7 @@ class _BitNetPacked2bitLinear(torch.autograd.Function):
         # use int8 tensor cores
         # NOTE: is doing dequant inside matmul faster when M is large?
         weight_i8 = _unpack_i2_in_i8(weight_i2)
-        out = scaled_int8_mm(input_i8.contiguous(), weight_i8.contiguous().T, row_scale, tensor_scale)
+        out = scaled_mm(input_i8.contiguous(), weight_i8.contiguous().T, row_scale, tensor_scale)
         out = out.view(*batch_dims, weight.shape[0])
 
         out = out + bias if bias is not None else out
