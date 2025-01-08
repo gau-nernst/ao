@@ -2,18 +2,19 @@ import pandas as pd
 import torch
 from triton.testing import do_bench
 
-from torchao.prototype.quantized_training.kernel import scaled_mm
+from torchao.prototype.quantized_training.kernel_notriton import (
+    scaled_mm as scaled_mm_inductor,
+)
+from torchao.prototype.quantized_training.kernel_triton import scaled_mm
 
 
 def bench_f(f, *args, **kwargs):
     return do_bench(lambda: f(*args, **kwargs), return_mode="median")
 
 
-@torch.compile(mode="max-autotune", dynamic=False)
-def scaled_int8_mm_inductor(A: torch.Tensor, B: torch.Tensor, scale_A: torch.Tensor, scale_B: torch.Tensor):
-    return torch._int_mm(A, B) * scale_B * scale_A
-
-
+scaled_mm_inductor = torch.compile(
+    scaled_mm_inductor, mode="max-autotune", dynamic=False
+)
 torch._dynamo.config.cache_size_limit = 1000
 torch._inductor.config.force_fuse_int_mm_with_mul = True
 
@@ -47,12 +48,19 @@ for M, N, K in shapes:
     # benchmark F.linear() i.e. A @ B.T
     bf16_time = bench_f(torch.mm, A_bf16, B_bf16.T)
     cublas_i8_time = bench_f(torch._int_mm, A_i8, B_i8.T)
-    inductor_scaled_i8_time = bench_f(scaled_int8_mm_inductor, A_i8, B_i8.T, scale_A, scale_B)
+    inductor_scaled_i8_time = bench_f(
+        scaled_mm_inductor, A_i8, B_i8.T, scale_A, scale_B
+    )
     triton_scaled_i8_time = bench_f(scaled_mm, A_i8, B_i8.T, scale_A, scale_B)
 
     # torch._scaled_mm() only supports tensor-wise FP32 scaling for Ada
     cublas_scaled_f8_time = bench_f(
-        torch._scaled_mm, A_f8, B_f8.T, scale_A[0, 0].float(), scale_B[0, 0].float(), out_dtype=scale_A.dtype
+        torch._scaled_mm,
+        A_f8,
+        B_f8.T,
+        scale_A[0, 0].float(),
+        scale_B[0, 0].float(),
+        out_dtype=scale_A.dtype,
     )
     triton_scaled_f8_time = bench_f(scaled_mm, A_f8, B_f8.T, scale_A, scale_B)
 

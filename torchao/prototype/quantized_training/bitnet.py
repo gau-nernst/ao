@@ -18,14 +18,10 @@ from torchao.utils import TorchAOBaseTensor
 from .int8 import quantize_int8_rowwise
 
 if has_triton():
-    from .kernel import scaled_mm
+    from .kernel_triton import scaled_mm
 
 else:
-    # This is less performant than the explicit hand-written Triton kernel, though things might
-    # change in the future.
-    # Multiplying col_scale first is faster than the other way round.
-    def scaled_mm(A: Tensor, B: Tensor, row_scale: Tensor, col_scale: Tensor) -> Tensor:
-        return torch._int_mm(A, B) * col_scale.view(-1) * row_scale.view(-1, 1)
+    from .kernel_notriton import scaled_mm
 
 
 aten = torch.ops.aten
