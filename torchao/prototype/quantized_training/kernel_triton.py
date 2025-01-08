@@ -130,7 +130,13 @@ def _scaled_mm_kernel(
     tl.store(C_ptr + tl.broadcast_to(xindex, mask.shape), acc, mask)
 
 
-@triton.autotune(configs=configs, key=["M", "N", "K", "stride_ak", "stride_bk"])
+@triton.autotune(
+    configs=[
+        triton.Config(dict(BLOCK_M=128, BLOCK_N=128), num_stages=2, num_warps=8),
+        triton.Config(dict(BLOCK_M=128, BLOCK_N=128), num_stages=3, num_warps=8),
+    ],
+    key=["M", "N", "K", "stride_ak", "stride_bk"],
+)
 @triton.jit
 def _tile_scaled_mm_kernel(
     A_ptr,  # (M, K)
@@ -189,25 +195,24 @@ def _tile_scaled_mm_kernel(
     # we use 2 accumulators. acc is the final result. mma_acc is accumulator for MMA before
     # scaling. for every QUANT_BLOCK_K, we will scale mma_acc and accumulate it to acc.
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    mma_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
-    for k in range(K, 0, -BLOCK_K):
-        if EVEN_K:
-            a = tl.load(A)
-            b = tl.load(B)
-        else:
-            a = tl.load(A, mask=rk[None, :] < k, other=0.0)
-            b = tl.load(B, mask=rk[:, None] < k, other=0.0)
-        mma_acc += tl.dot(a, b)
-        A += BLOCK_K * stride_ak
-        B += BLOCK_K * stride_bk
+    for k in range(K, 0, -QUANT_BLOCK_K):
+        mma_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
+        for _ in tl.static_range(QUANT_BLOCK_K // BLOCK_K):
+            if EVEN_K:
+                a = tl.load(A)
+                b = tl.load(B)
+            else:
+                a = tl.load(A, mask=rk[None, :] < k, other=0.0)
+                b = tl.load(B, mask=rk[:, None] < k, other=0.0)
+            mma_acc += tl.dot(a, b)
+            A += BLOCK_K * stride_ak
+            B += BLOCK_K * stride_bk
 
-        if (k - BLOCK_K) % QUANT_BLOCK_K == 0:
-            a_scale = tl.load(A_scale).to(tl.float32)
-            b_scale = tl.load(B_scale).to(tl.float32)
-            acc += mma_acc.to(tl.float32) * a_scale * b_scale
-            mma_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
-            A_scale += stride_scale_ak
-            B_scale += stride_scale_bk
+        a_scale = tl.load(A_scale).to(tl.float32)
+        b_scale = tl.load(B_scale).to(tl.float32)
+        acc += mma_acc.to(tl.float32) * a_scale * b_scale
+        A_scale += stride_scale_ak
+        B_scale += stride_scale_bk
 
     # rematerialize rm and rn to save registers
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -297,6 +302,12 @@ def tile_scaled_mm_cuda(A: Tensor, B: Tensor, scale_A: Tensor, scale_B: Tensor):
         triton.cdiv(meta["M"], meta["BLOCK_M"])
         * triton.cdiv(meta["N"], meta["BLOCK_N"]),
     )
+
+    # for small QUANT_BLOCK_K (e.g. <128), using BLOCK_K=QUANT_BLOCK_K is often optimal.
+    # for large QUANT_BLOCK_K, using large BLOCK_K will consume too much shared memory.
+    QUANT_BLOCK_K = A.shape[1] // scale_A.shape[1]
+    BLOCK_K = min(QUANT_BLOCK_K, 128)
+
     _tile_scaled_mm_kernel[grid](
         A,
         B,
@@ -313,7 +324,8 @@ def tile_scaled_mm_cuda(A: Tensor, B: Tensor, scale_A: Tensor, scale_B: Tensor):
         *scale_B.stride(),
         QUANT_BLOCK_M=A.shape[0] // scale_A.shape[0],
         QUANT_BLOCK_N=B.shape[1] // scale_B.shape[1],
-        QUANT_BLOCK_K=A.shape[1] // scale_A.shape[1],
+        QUANT_BLOCK_K=QUANT_BLOCK_K,
+        BLOCK_K=BLOCK_K,
         ACC_DTYPE=tl.int32 if A.dtype == torch.int8 else tl.float32,
         EVEN_K=K % 2 == 0,
     )
