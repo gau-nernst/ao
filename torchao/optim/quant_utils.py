@@ -127,9 +127,7 @@ def _fp32_to_bf16_sr(x_f32: Tensor) -> Tensor:
     # [a15, ..., a0] / 2^16, where the bit pattern [a15, ..., a0] is interpreted as uint16
     #
     # we have to use int32 since most arithmetic ops are not implemented for uint32/int16/uint16
-    rand_16bit = torch.randint(
-        0, 1 << 16, x_f32.shape, device=x_f32.device, dtype=torch.int32
-    )
+    rand_16bit = torch.empty_like(x_f32, dtype=torch.int32).random_(1 << 16)
     x_f32_bits = x_f32.view(torch.int32)
     x_fraction = x_f32_bits & 0xFFFF  # lower 16 bits
     x_bf16_towards_zero = x_f32_bits & 0xFFFF0000  # upper 16 bits
